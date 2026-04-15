@@ -1,0 +1,238 @@
+from flask import Flask, request, redirect, url_for, render_template_string, abort
+import sqlite3
+from pathlib import Path
+import os
+
+app = Flask(__name__)
+app.secret_key = os.environ.get("SECRET_KEY", "change-this-in-production")
+DB_PATH = Path("knowledge.db")
+
+MAX_TITLE_LEN = 200
+MAX_TAGS_LEN = 200
+MAX_CONTENT_LEN = 10000
+
+HTML = """
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Simple Knowledge Management System</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 40px; max-width: 900px; }
+    h1, h2 { margin-bottom: 10px; }
+    form { margin-bottom: 30px; padding: 20px; border: 1px solid #ddd; border-radius: 8px; }
+    input[type="text"], textarea {
+      width: 100%; padding: 10px; margin-top: 8px; margin-bottom: 16px;
+      border: 1px solid #ccc; border-radius: 6px; box-sizing: border-box;
+    }
+    textarea { min-height: 120px; }
+    button {
+      background: black; color: white; border: none; padding: 10px 16px;
+      border-radius: 6px; cursor: pointer;
+    }
+    .card {
+      border: 1px solid #ddd; border-radius: 8px; padding: 16px; margin-bottom: 16px;
+    }
+    .meta { color: #666; font-size: 14px; margin-bottom: 10px; }
+    .actions { display: inline-flex; gap: 12px; }
+    .actions a { text-decoration: none; }
+    .search-bar { margin-bottom: 24px; }
+  </style>
+</head>
+<body>
+  <h1>Simple Knowledge Management System</h1>
+  <p>Save, search, edit, and delete knowledge entries.</p>
+
+  <form class="search-bar" method="get" action="/">
+    <input type="text" name="q" placeholder="Search by title, tag, or content..." value="{{ query }}">
+    <button type="submit">Search</button>
+  </form>
+
+  <form method="post" action="/add">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <h2>Add New Entry</h2>
+    <label>Title</label>
+    <input type="text" name="title" maxlength="200" required>
+
+    <label>Tags (comma-separated)</label>
+    <input type="text" name="tags" maxlength="200" placeholder="AI, Copilot, Strategy">
+
+    <label>Content</label>
+    <textarea name="content" maxlength="10000" required></textarea>
+
+    <button type="submit">Save Entry</button>
+  </form>
+
+  <h2>Entries</h2>
+  {% for entry in entries %}
+    <div class="card">
+      <h3>{{ entry['title'] }}</h3>
+      <div class="meta">Tags: {{ entry['tags'] or '-' }}</div>
+      <p>{{ entry['content'] }}</p>
+      <div class="actions">
+        <a href="/edit/{{ entry['id'] }}">Edit</a>
+        <form method="post" action="/delete/{{ entry['id'] }}" style="display:inline" onsubmit="return confirm('Delete this entry?');">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button type="submit" style="background:none; color:#c00; border:none; cursor:pointer; padding:0; font-size:inherit;">Delete</button>
+        </form>
+      </div>
+    </div>
+  {% else %}
+    <p>No entries found.</p>
+  {% endfor %}
+</body>
+</html>
+"""
+
+EDIT_HTML = """
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Edit Entry</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 40px; max-width: 900px; }
+    form { padding: 20px; border: 1px solid #ddd; border-radius: 8px; }
+    input[type="text"], textarea {
+      width: 100%; padding: 10px; margin-top: 8px; margin-bottom: 16px;
+      border: 1px solid #ccc; border-radius: 6px; box-sizing: border-box;
+    }
+    textarea { min-height: 140px; }
+    button {
+      background: black; color: white; border: none; padding: 10px 16px;
+      border-radius: 6px; cursor: pointer;
+    }
+    a { display: inline-block; margin-top: 16px; }
+  </style>
+</head>
+<body>
+  <h1>Edit Entry</h1>
+  <form method="post">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <label>Title</label>
+    <input type="text" name="title" maxlength="200" value="{{ entry['title'] }}" required>
+
+    <label>Tags</label>
+    <input type="text" name="tags" maxlength="200" value="{{ entry['tags'] }}">
+
+    <label>Content</label>
+    <textarea name="content" maxlength="10000" required>{{ entry['content'] }}</textarea>
+
+    <button type="submit">Update Entry</button>
+  </form>
+  <a href="/">← Back</a>
+</body>
+</html>
+"""
+
+
+def get_db_connection():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    with get_db_connection() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS entries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                tags TEXT,
+                content TEXT NOT NULL
+            )
+            """
+        )
+
+
+def generate_csrf_token():
+    import secrets
+    from flask import session
+    if "csrf_token" not in session:
+        session["csrf_token"] = secrets.token_hex(32)
+    return session["csrf_token"]
+
+
+def validate_csrf():
+    from flask import session
+    token = request.form.get("csrf_token", "")
+    if not token or token != session.get("csrf_token"):
+        abort(403)
+
+
+app.jinja_env.globals["csrf_token"] = generate_csrf_token
+
+
+@app.route("/")
+def index():
+    query = request.args.get("q", "").strip()
+    with get_db_connection() as conn:
+        if query:
+            like_query = f"%{query}%"
+            entries = conn.execute(
+                """
+                SELECT * FROM entries
+                WHERE title LIKE ? OR tags LIKE ? OR content LIKE ?
+                ORDER BY id DESC
+                """,
+                (like_query, like_query, like_query),
+            ).fetchall()
+        else:
+            entries = conn.execute("SELECT * FROM entries ORDER BY id DESC").fetchall()
+
+    return render_template_string(HTML, entries=entries, query=query)
+
+
+@app.route("/add", methods=["POST"])
+def add_entry():
+    validate_csrf()
+    title = request.form["title"].strip()[:MAX_TITLE_LEN]
+    tags = request.form.get("tags", "").strip()[:MAX_TAGS_LEN]
+    content = request.form["content"].strip()[:MAX_CONTENT_LEN]
+
+    with get_db_connection() as conn:
+        conn.execute(
+            "INSERT INTO entries (title, tags, content) VALUES (?, ?, ?)",
+            (title, tags, content),
+        )
+
+    return redirect(url_for("index"))
+
+
+@app.route("/edit/<int:entry_id>", methods=["GET", "POST"])
+def edit_entry(entry_id):
+    with get_db_connection() as conn:
+        entry = conn.execute("SELECT * FROM entries WHERE id = ?", (entry_id,)).fetchone()
+
+        if entry is None:
+            abort(404)
+
+        if request.method == "POST":
+            validate_csrf()
+            title = request.form["title"].strip()[:MAX_TITLE_LEN]
+            tags = request.form.get("tags", "").strip()[:MAX_TAGS_LEN]
+            content = request.form["content"].strip()[:MAX_CONTENT_LEN]
+
+            conn.execute(
+                "UPDATE entries SET title = ?, tags = ?, content = ? WHERE id = ?",
+                (title, tags, content, entry_id),
+            )
+            return redirect(url_for("index"))
+
+    return render_template_string(EDIT_HTML, entry=entry)
+
+
+@app.route("/delete/<int:entry_id>", methods=["POST"])
+def delete_entry(entry_id):
+    validate_csrf()
+    with get_db_connection() as conn:
+        conn.execute("DELETE FROM entries WHERE id = ?", (entry_id,))
+    return redirect(url_for("index"))
+
+
+if __name__ == "__main__":
+    init_db()
+    app.run(debug=os.environ.get("FLASK_DEBUG", "false").lower() == "true")
