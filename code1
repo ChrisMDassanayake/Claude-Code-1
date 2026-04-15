@@ -1,0 +1,216 @@
+from flask import Flask, request, redirect, url_for, render_template_string
+import sqlite3
+from pathlib import Path
+
+app = Flask(__name__)
+DB_PATH = Path("knowledge.db")
+
+HTML = """
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Simple Knowledge Management System</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 40px; max-width: 900px; }
+    h1, h2 { margin-bottom: 10px; }
+    form { margin-bottom: 30px; padding: 20px; border: 1px solid #ddd; border-radius: 8px; }
+    input[type="text"], textarea {
+      width: 100%; padding: 10px; margin-top: 8px; margin-bottom: 16px;
+      border: 1px solid #ccc; border-radius: 6px; box-sizing: border-box;
+    }
+    textarea { min-height: 120px; }
+    button {
+      background: black; color: white; border: none; padding: 10px 16px;
+      border-radius: 6px; cursor: pointer;
+    }
+    .card {
+      border: 1px solid #ddd; border-radius: 8px; padding: 16px; margin-bottom: 16px;
+    }
+    .meta { color: #666; font-size: 14px; margin-bottom: 10px; }
+    .actions a { margin-right: 12px; text-decoration: none; }
+    .search-bar { margin-bottom: 24px; }
+  </style>
+</head>
+<body>
+  <h1>Simple Knowledge Management System</h1>
+  <p>Save, search, edit, and delete knowledge entries.</p>
+
+  <form class="search-bar" method="get" action="/">
+    <input type="text" name="q" placeholder="Search by title, tag, or content..." value="{{ query }}">
+    <button type="submit">Search</button>
+  </form>
+
+  <form method="post" action="/add">
+    <h2>Add New Entry</h2>
+    <label>Title</label>
+    <input type="text" name="title" required>
+
+    <label>Tags (comma-separated)</label>
+    <input type="text" name="tags" placeholder="AI, Copilot, Strategy">
+
+    <label>Content</label>
+    <textarea name="content" required></textarea>
+
+    <button type="submit">Save Entry</button>
+  </form>
+
+  <h2>Entries</h2>
+  {% for entry in entries %}
+    <div class="card">
+      <h3>{{ entry['title'] }}</h3>
+      <div class="meta">Tags: {{ entry['tags'] or '-' }}</div>
+      <p>{{ entry['content'] }}</p>
+      <div class="actions">
+        <a href="/edit/{{ entry['id'] }}">Edit</a>
+        <a href="/delete/{{ entry['id'] }}" onclick="return confirm('Delete this entry?');">Delete</a>
+      </div>
+    </div>
+  {% else %}
+    <p>No entries found.</p>
+  {% endfor %}
+</body>
+</html>
+"""
+
+EDIT_HTML = """
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Edit Entry</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 40px; max-width: 900px; }
+    form { padding: 20px; border: 1px solid #ddd; border-radius: 8px; }
+    input[type="text"], textarea {
+      width: 100%; padding: 10px; margin-top: 8px; margin-bottom: 16px;
+      border: 1px solid #ccc; border-radius: 6px; box-sizing: border-box;
+    }
+    textarea { min-height: 140px; }
+    button {
+      background: black; color: white; border: none; padding: 10px 16px;
+      border-radius: 6px; cursor: pointer;
+    }
+    a { display: inline-block; margin-top: 16px; }
+  </style>
+</head>
+<body>
+  <h1>Edit Entry</h1>
+  <form method="post">
+    <label>Title</label>
+    <input type="text" name="title" value="{{ entry['title'] }}" required>
+
+    <label>Tags</label>
+    <input type="text" name="tags" value="{{ entry['tags'] }}">
+
+    <label>Content</label>
+    <textarea name="content" required>{{ entry['content'] }}</textarea>
+
+    <button type="submit">Update Entry</button>
+  </form>
+  <a href="/">← Back</a>
+</body>
+</html>
+"""
+
+
+def get_db_connection():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    conn = get_db_connection()
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS entries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            tags TEXT,
+            content TEXT NOT NULL
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+@app.route("/")
+def index():
+    query = request.args.get("q", "").strip()
+    conn = get_db_connection()
+
+    if query:
+        like_query = f"%{query}%"
+        entries = conn.execute(
+            """
+            SELECT * FROM entries
+            WHERE title LIKE ? OR tags LIKE ? OR content LIKE ?
+            ORDER BY id DESC
+            """,
+            (like_query, like_query, like_query),
+        ).fetchall()
+    else:
+        entries = conn.execute("SELECT * FROM entries ORDER BY id DESC").fetchall()
+
+    conn.close()
+    return render_template_string(HTML, entries=entries, query=query)
+
+
+@app.route("/add", methods=["POST"])
+def add_entry():
+    title = request.form["title"].strip()
+    tags = request.form.get("tags", "").strip()
+    content = request.form["content"].strip()
+
+    conn = get_db_connection()
+    conn.execute(
+        "INSERT INTO entries (title, tags, content) VALUES (?, ?, ?)",
+        (title, tags, content),
+    )
+    conn.commit()
+    conn.close()
+    return redirect(url_for("index"))
+
+
+@app.route("/edit/<int:entry_id>", methods=["GET", "POST"])
+def edit_entry(entry_id):
+    conn = get_db_connection()
+    entry = conn.execute("SELECT * FROM entries WHERE id = ?", (entry_id,)).fetchone()
+
+    if entry is None:
+        conn.close()
+        return "Entry not found", 404
+
+    if request.method == "POST":
+        title = request.form["title"].strip()
+        tags = request.form.get("tags", "").strip()
+        content = request.form["content"].strip()
+
+        conn.execute(
+            "UPDATE entries SET title = ?, tags = ?, content = ? WHERE id = ?",
+            (title, tags, content, entry_id),
+        )
+        conn.commit()
+        conn.close()
+        return redirect(url_for("index"))
+
+    conn.close()
+    return render_template_string(EDIT_HTML, entry=entry)
+
+
+@app.route("/delete/<int:entry_id>")
+def delete_entry(entry_id):
+    conn = get_db_connection()
+    conn.execute("DELETE FROM entries WHERE id = ?", (entry_id,))
+    conn.commit()
+    conn.close()
+    return redirect(url_for("index"))
+
+
+if __name__ == "__main__":
+    init_db()
+    app.run(debug=True)
